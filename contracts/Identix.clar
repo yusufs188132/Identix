@@ -51,6 +51,52 @@
 
 (define-data-var max-delegation-depth uint u3)
 
+(define-constant RECOVERY-DELAY-BLOCKS u144)
+(define-constant MAX-RECOVERY-AGENTS u5)
+(define-constant MIN-RECOVERY-THRESHOLD u2)
+
+(define-map identity-recovery-agents
+    { id: uint, agent: principal }
+    {
+        active: bool,
+        added-at: uint,
+        agent-name: (string-ascii 64)
+    }
+)
+
+(define-map identity-recovery-config
+    { id: uint }
+    {
+        threshold: uint,
+        active-agents: uint,
+        emergency-mode: bool,
+        last-updated: uint
+    }
+)
+
+(define-map recovery-requests
+    { id: uint, request-id: uint }
+    {
+        new-owner: principal,
+        requester: principal,
+        created-at: uint,
+        execution-block: uint,
+        approvals: uint,
+        executed: bool,
+        cancelled: bool
+    }
+)
+
+(define-map recovery-approvals
+    { id: uint, request-id: uint, agent: principal }
+    {
+        approved: bool,
+        timestamp: uint
+    }
+)
+
+(define-data-var next-recovery-request-id uint u1)
+
 (define-public (create-identity)
     (let
         (
@@ -359,3 +405,267 @@
         (ok true)
     )
 )
+
+(define-public (add-recovery-agent (id uint) (agent principal) (agent-name (string-ascii 64)))
+    (let
+        (
+            (identity (unwrap! (get-identity-record id) (err u1)))
+            (config (get-recovery-config id))
+            (current-agents (get active-agents config))
+        )
+        (asserts! (is-owner id tx-sender) (err u2))
+        (asserts! (get active identity) (err u3))
+        (asserts! (< current-agents MAX-RECOVERY-AGENTS) (err u17))
+        (asserts! (not (is-eq agent tx-sender)) (err u18))
+        (asserts! (is-none (get-recovery-agent id agent)) (err u19))
+        (map-set identity-recovery-agents
+            { id: id, agent: agent }
+            {
+                active: true,
+                added-at: stacks-block-height,
+                agent-name: agent-name
+            }
+        )
+        (map-set identity-recovery-config
+            { id: id }
+            (merge config 
+                { 
+                    active-agents: (+ current-agents u1),
+                    last-updated: stacks-block-height
+                }
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-public (remove-recovery-agent (id uint) (agent principal))
+    (let
+        (
+            (identity (unwrap! (get-identity-record id) (err u1)))
+            (agent-record (unwrap! (get-recovery-agent id agent) (err u20)))
+            (config (get-recovery-config id))
+            (current-agents (get active-agents config))
+        )
+        (asserts! (is-owner id tx-sender) (err u2))
+        (asserts! (get active identity) (err u3))
+        (asserts! (get active agent-record) (err u21))
+        (map-set identity-recovery-agents
+            { id: id, agent: agent }
+            (merge agent-record { active: false })
+        )
+        (map-set identity-recovery-config
+            { id: id }
+            (merge config 
+                { 
+                    active-agents: (- current-agents u1),
+                    last-updated: stacks-block-height
+                }
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-public (set-recovery-threshold (id uint) (threshold uint))
+    (let
+        (
+            (identity (unwrap! (get-identity-record id) (err u1)))
+            (config (get-recovery-config id))
+            (current-agents (get active-agents config))
+        )
+        (asserts! (is-owner id tx-sender) (err u2))
+        (asserts! (get active identity) (err u3))
+        (asserts! (>= threshold MIN-RECOVERY-THRESHOLD) (err u22))
+        (asserts! (<= threshold current-agents) (err u23))
+        (map-set identity-recovery-config
+            { id: id }
+            (merge config 
+                { 
+                    threshold: threshold,
+                    last-updated: stacks-block-height
+                }
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-public (initiate-recovery (id uint) (new-owner principal))
+    (let
+        (
+            (identity (unwrap! (get-identity-record id) (err u1)))
+            (agent-record (unwrap! (get-recovery-agent id tx-sender) (err u24)))
+            (config (get-recovery-config id))
+            (request-id (var-get next-recovery-request-id))
+        )
+        (asserts! (get active identity) (err u3))
+        (asserts! (get active agent-record) (err u21))
+        (asserts! (> (get threshold config) u0) (err u25))
+        (asserts! (not (is-eq new-owner (get owner identity))) (err u26))
+        (map-set recovery-requests
+            { id: id, request-id: request-id }
+            {
+                new-owner: new-owner,
+                requester: tx-sender,
+                created-at: stacks-block-height,
+                execution-block: (+ stacks-block-height RECOVERY-DELAY-BLOCKS),
+                approvals: u1,
+                executed: false,
+                cancelled: false
+            }
+        )
+        (map-set recovery-approvals
+            { id: id, request-id: request-id, agent: tx-sender }
+            {
+                approved: true,
+                timestamp: stacks-block-height
+            }
+        )
+        (var-set next-recovery-request-id (+ request-id u1))
+        (ok request-id)
+    )
+)
+
+(define-public (approve-recovery (id uint) (request-id uint))
+    (let
+        (
+            (identity (unwrap! (get-identity-record id) (err u1)))
+            (agent-record (unwrap! (get-recovery-agent id tx-sender) (err u24)))
+            (request (unwrap! (get-recovery-request id request-id) (err u27)))
+            (existing-approval (get-recovery-approval id request-id tx-sender))
+        )
+        (asserts! (get active identity) (err u3))
+        (asserts! (get active agent-record) (err u21))
+        (asserts! (not (get executed request)) (err u28))
+        (asserts! (not (get cancelled request)) (err u29))
+        (asserts! (is-none existing-approval) (err u30))
+        (map-set recovery-approvals
+            { id: id, request-id: request-id, agent: tx-sender }
+            {
+                approved: true,
+                timestamp: stacks-block-height
+            }
+        )
+        (map-set recovery-requests
+            { id: id, request-id: request-id }
+            (merge request { approvals: (+ (get approvals request) u1) })
+        )
+        (ok true)
+    )
+)
+
+(define-public (execute-recovery (id uint) (request-id uint))
+    (let
+        (
+            (identity (unwrap! (get-identity-record id) (err u1)))
+            (request (unwrap! (get-recovery-request id request-id) (err u27)))
+            (config (get-recovery-config id))
+        )
+        (asserts! (get active identity) (err u3))
+        (asserts! (not (get executed request)) (err u28))
+        (asserts! (not (get cancelled request)) (err u29))
+        (asserts! (>= (get approvals request) (get threshold config)) (err u31))
+        (asserts! (>= stacks-block-height (get execution-block request)) (err u32))
+        (map-set identity-records
+            { id: id }
+            {
+                owner: (get new-owner request),
+                active: true,
+                created-at: (get created-at identity),
+                updated-at: stacks-block-height
+            }
+        )
+        (map-set recovery-requests
+            { id: id, request-id: request-id }
+            (merge request { executed: true })
+        )
+        (unwrap! (clear-all-delegations id) (err u15))
+        (unwrap! (clear-recovery-config id) (err u33))
+        (ok true)
+    )
+)
+
+(define-public (cancel-recovery (id uint) (request-id uint))
+    (let
+        (
+            (identity (unwrap! (get-identity-record id) (err u1)))
+            (request (unwrap! (get-recovery-request id request-id) (err u27)))
+        )
+        (asserts! (get active identity) (err u3))
+        (asserts! (is-owner id tx-sender) (err u2))
+        (asserts! (not (get executed request)) (err u28))
+        (asserts! (not (get cancelled request)) (err u29))
+        (map-set recovery-requests
+            { id: id, request-id: request-id }
+            (merge request { cancelled: true })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-recovery-agent (id uint) (agent principal))
+    (map-get? identity-recovery-agents { id: id, agent: agent })
+)
+
+(define-read-only (get-recovery-config (id uint))
+    (default-to 
+        {
+            threshold: u0,
+            active-agents: u0,
+            emergency-mode: false,
+            last-updated: u0
+        }
+        (map-get? identity-recovery-config { id: id })
+    )
+)
+
+(define-read-only (get-recovery-request (id uint) (request-id uint))
+    (map-get? recovery-requests { id: id, request-id: request-id })
+)
+
+(define-read-only (get-recovery-approval (id uint) (request-id uint) (agent principal))
+    (map-get? recovery-approvals { id: id, request-id: request-id, agent: agent })
+)
+
+(define-read-only (is-recovery-agent (id uint) (agent principal))
+    (match (get-recovery-agent id agent)
+        agent-record (get active agent-record)
+        false
+    )
+)
+
+(define-read-only (can-execute-recovery (id uint) (request-id uint))
+    (match (get-recovery-request id request-id)
+        request
+        (let
+            (
+                (config (get-recovery-config id))
+            )
+            (and
+                (not (get executed request))
+                (not (get cancelled request))
+                (>= (get approvals request) (get threshold config))
+                (>= stacks-block-height (get execution-block request))
+            )
+        )
+        false
+    )
+)
+
+(define-private (clear-recovery-config (id uint))
+    (begin
+        (map-set identity-recovery-config
+            { id: id }
+            {
+                threshold: u0,
+                active-agents: u0,
+                emergency-mode: false,
+                last-updated: stacks-block-height
+            }
+        )
+        (ok true)
+    )
+)
+
+
